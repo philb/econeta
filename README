@@ -1,0 +1,52 @@
+EconetA  (v8.02)
+~~~~~~~
+
+This is a DCI-3 driver for Econet.  Armed with this, you should be able to convince Freenet to talk across your local network.  I wrote it so that I could use a BBC to log into my Linux machine.
+
+Acorn TCP/IP also comes with an EconetA driver, but that one seems to have trouble with ARP under Freenet, for reasons nobody quite understands.  Also, it's not much help to people who don't have Acorn TCP/IP in the first place.
+
+After loading the driver, you need to say something like:
+
+   ifconfig ec0 inet nnn.nnn.nnn.nnn arp up
+   
+Then, so long as you've set up appropriate routes, you should be in business.
+
+It ought to be completely compatible with any other software running IP over Econet, but there may be problems.
+
+NB.  This is a beta-test release.  It has bugs.  Please tell me about them.
+
+This software is, as always, provided with no warranty.  Nope, not even the implied guarantee of merchantability or fitness for a purpose.  You use it entirely at your own risk -- if it precipitates the end of the world, that's your fault.
+
+This software is also public domain.  Do what you like with it.
+
+--
+Phil Blundell <Philip.Blundell@pobox.com>
+voice 0973 869202
+
+
+version 8.02
+
+ + *EcInfo improved.  Tx 'sync' and rx fields now do something useful.  Our ether address displayed in hex not decimal.  <duh!>
+ 
+ + Internal tidying up.
+ 
+ + Fixed mbuf-leak bug.
+ 
+ + Scan tx queue every few seconds to mop up entries where we lost the event.
+ 
+ + Don't do transmits asynchronously, there seems to be a bug.
+ 
+version 8.01
+
+ + Dubious re-entrancy has been tidied up.
+
+ + It doesn't seem to stamp on bits of the RMA now. 
+ 
+ + There is still a memory leak; Freenet doesn't return mbufs we use to the free-list.  Eventually it will run out of mbufs altogether, which will render Freenet useless (and SLIPdriver will die with an address exception).
+
+ + We can now fall back on small mbufs if there aren't any free big ones.
+
+ + Asynchronous transmits are now implemented, though Freenet doesn't seem to use them.  Multiple receive buffers are also implemented.  These two may make things a little faster.
+
+ + *EcInfo has been added.
+ 

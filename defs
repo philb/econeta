@@ -1,0 +1,17 @@
+/*
+ * Created by cmhg vsn 4.00 [May  3 1991]
+ */
+
+#ifndef __cmhg_defs_h
+#define __cmhg_defs_h
+
+#define  Ec_00                 0x043cc0
+#define  Ec_Start              0x043cc0
+#define  Ec_Up                 0x043cc1
+#define  Ec_Down               0x043cc2
+#define  Ec_Send               0x043cc3
+#define  Ec_Version            0x043cc4
+#define  Ec_MTU                0x043cc5
+#define  Ec_TxEvReq            0x043cc6
+
+#endif

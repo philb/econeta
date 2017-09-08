@@ -1,0 +1,18 @@
+help-string:  EconetA 8.03 © Philip Blundell
+
+title-string: EconetA
+
+initialisation-code: ec_initialise
+
+swi-chunk-base-number: 0x43cc0
+swi-handler-code:      ec_swi
+swi-decoding-table:    Ec,
+                       Start Up Down Send Version MTU TxEvReq
+
+service-call-handler: ec_service
+
+irq-handlers: ec_event_entry/ec_event_handler,ec_ticker_entry/ec_ticker_handler
+
+command-keyword-table: ec_cmd
+  EcInfo(min-args:0, max-args:0, help-text: "*EcInfo displays EconetA's internal statistics.\nSyntax: *EcInfo\n")
+  

@@ -1,0 +1,589 @@
+/* c.ecmain */
+/* EconetA DCI-3 driver */
+
+/* © 1995 Philip Blundell */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "kernel.h"
+#include "ec.h"
+#include "swis.h"
+
+_kernel_oserror err;
+
+int rxcb[NUM_RXCBS];
+unsigned char *rxbuf[NUM_RXCBS];
+struct tx *txqueue[TX_QUEUE_LENGTH];
+
+int rxevent;
+
+unsigned char local_stn, local_net;
+char local_addr[6] = {0, 0, 0, 0, 0, 0};
+
+struct dib our_dib;
+struct mbuf **freeq = NULL, **lfreeq = NULL;
+
+struct ec_stats stats;
+
+void *private_word;
+
+extern void ec_event_entry(_kernel_swi_regs *, void *);
+extern void ec_ticker_entry(void);
+
+#define lesser(a,b)   (((a)<(b))?(a):(b))
+
+
+/* -- mbuf handling */
+
+#if 0
+static void dump_mbuf(struct mbuf *mb)
+{
+  printf("mbuf at %08x (next = %08x)\n", mb, mb->m_next);
+  printf("off=%d, len=%d, type=%d, indir=%d\n", mb->m_off, mb->m_len, mb->m_type, mb->m_indir);
+  if (mb->m_next) dump_mbuf(mb->m_next);
+}
+#endif
+
+static struct mbuf *get_small_mbuf(void)
+{
+  struct mbuf *m;
+  _kernel_irqs_off();
+  m = *freeq;
+  if (m) {
+    *freeq = m->m_next;
+    m->m_next = NULL;
+  }
+  return m;
+}
+
+static struct mbuf *get_large_mbuf(void)
+{
+  struct mbuf *m;
+  _kernel_irqs_off();
+  m = *lfreeq;
+  if (m) {
+    *lfreeq = m->m_next;
+    m->m_next = NULL;
+  }
+  return m;
+}
+
+static int copy_from_mbufs(struct mbuf *mb, char *dest, int count)
+{
+  char *src;
+  int todo, done;
+  if (mb->m_indir) {
+    src = mb->m_un.mun_datp;
+  } else {
+    src = (char *)mb + mb->m_off;
+  }
+  todo = done = lesser(count, mb->m_len);
+  count -= todo;
+  while (todo--) *(dest++) = *(src++);
+  if (count && mb->m_next)
+    done += copy_from_mbufs(mb->m_next, dest, count);
+  return done;
+}
+
+
+/* -- transmission code */
+
+static void ec_send_arp(struct tx *tx, char *dest)
+{
+  char *buffer;
+  char *txbuf = malloc(8);
+  _kernel_swi_regs r;
+  if (!txbuf) return;
+  buffer = malloc(28);
+  if (!buffer) {
+    free(txbuf);
+    return;
+  }
+  copy_from_mbufs(tx->mb, buffer, 28);
+  txbuf[0] = buffer[14];
+  txbuf[1] = buffer[15];
+  txbuf[2] = buffer[16];
+  txbuf[3] = buffer[17];
+  txbuf[4] = buffer[24];
+  txbuf[5] = buffer[25];
+  txbuf[6] = buffer[26];
+  txbuf[7] = buffer[27];
+  r.r[0] = (buffer[7] == 1)?EcCb_ARP:EcCb_ARPreply;
+  r.r[2] = (int)dest[4];
+  r.r[3] = (int)dest[5];
+  r.r[1] = IP_PORT;
+  r.r[4] = (int)txbuf;
+  r.r[5] = 8;
+  r.r[6] = 10;
+  r.r[7] = 5;
+  free(buffer);
+  if (_kernel_swi(Econet_StartTransmit, &r, &r)) {
+    free(txbuf);
+    return;
+  }
+  tx->handle = r.r[0];
+  tx->buffer = txbuf;
+}
+
+static void ec_send_ip(struct tx *tx, char *dest)
+{
+  char *buffer = malloc(1280);
+  _kernel_swi_regs r;
+  int len;
+  if (!buffer) return;
+  len = copy_from_mbufs(tx->mb, buffer, 1280);
+  r.r[0] = EcCb_Frame;
+  r.r[1] = IP_PORT;
+  r.r[2] = (int)dest[4];
+  r.r[3] = (int)dest[5];
+  r.r[4] = (int)buffer;
+  r.r[5] = len;
+  r.r[6] = 10;
+  r.r[7] = 5;
+  if (_kernel_swi(XOS_Bit | Econet_StartTransmit, &r, &r)) {
+    free(buffer);
+    return;
+  }
+  tx->handle = r.r[0];
+  tx->buffer = buffer;
+}
+
+static void tx_generate_event(int ev, struct mbuf *mb, char *drname, int pun, int result)
+{
+  _kernel_swi_regs r;
+  r.r[0] = ev;
+  r.r[1] = (int)mb;
+  r.r[2] = (int)drname;
+  r.r[3] = pun;
+  r.r[4] = result;
+  _kernel_swi(XOS_Bit | OS_GenerateEvent, &r, &r);
+}
+
+static void tx_complete(struct tx *tx)
+{
+  int result = 0xfe;
+  if (tx->handle) {
+    _kernel_swi_regs r;
+    r.r[0] = tx->handle;
+    _kernel_swi(XOS_Bit | Econet_AbandonTransmit, &r, &r);
+    result = r.r[0];
+  }
+  free(tx->buffer);
+  if (tx->event) tx_generate_event(tx->event, tx->mb, "ec", tx->pun, result);
+  switch(result) {
+    case 0: /* ok */
+      break;
+    case 1:
+      stats.tx.line_jammed++;
+      break;
+    case 2:
+      stats.tx.net_error++;
+      break;
+    case 3:
+      stats.tx.not_listening++;
+      break;
+    case 4:
+      stats.tx.no_clock++;
+      break;
+  }
+  if (tx->queue != -1)
+    txqueue[tx->queue] = NULL;
+  free(tx);
+}
+
+static void ec_send(_kernel_swi_regs *regs, void *pw)
+{
+  struct tx *tx = malloc(sizeof(struct tx));
+  stats.tx.packets++;
+  if (tx) {
+    tx->event = regs->r[5];
+    tx->handle = 0;
+    tx->pun = regs->r[1];
+    tx->mb = (struct mbuf *)(regs->r[4]);
+    tx->queue = -1;
+#ifndef ASYNC_TX
+    if (tx->event) {
+#else
+    {
+#endif
+      /* Protocol module wants an event when we complete.  Enqueue the
+         transmission now. */
+      int i;
+      for (i = 0; i < TX_QUEUE_LENGTH; i++) {
+        if (txqueue[i] == NULL) {
+          txqueue[i] = tx;
+          tx->queue = i;
+          break;
+        }
+      }
+    }
+  } else {
+    /* Couldn't allocate a tx structure */
+    if (regs->r[5])
+      tx_generate_event(regs->r[5], (struct mbuf *)(regs->r[4]), "ec", regs->r[1], 0xff);
+    stats.tx.dropped++;
+    return;
+  }
+  switch (regs->r[2]) {
+    case Frame_ARP:
+      ec_send_arp(tx, (char *)(regs->r[3]));
+      break;
+    case Frame_IP:
+      ec_send_ip(tx, (char *)(regs->r[3]));
+      break;
+  }
+  if (tx->handle == 0) {
+    /* Tx failed to start, probably not enough buffer space.  Drop it. */
+    tx_complete(tx);
+    stats.tx.dropped++;
+    return;
+  }
+  if (tx->queue == -1) {
+    /* We need a synchronous transmission, for whatever reason. */
+    _kernel_swi_regs r;
+    stats.tx.sync++;
+    do {
+      r.r[0] = tx->handle;
+      _kernel_swi(XOS_Bit | Econet_PollTransmit, &r, &r);
+    } while (r.r[0] > 4);
+    tx_complete(tx);
+  }
+}
+
+
+/* -- reception code */
+
+static void OpenRx(int slot)
+{
+  _kernel_swi_regs r;
+  if (rxcb[slot])
+    return;
+  r.r[0] = IP_PORT;
+  r.r[1] = 0xff;
+  r.r[2] = 0xff;
+  r.r[3] = (int)rxbuf[slot];
+  r.r[4] = 1024;
+  _kernel_swi(XOS_Bit | Econet_CreateReceive, &r, &r);
+  rxcb[slot] = r.r[0];
+}
+
+static void rx_handler(int stn, int net, int cb, void *buffer, int length)
+{
+  int frametype;
+  _kernel_swi_regs r;
+  struct mbuf *first, *mb;
+  if (net == 0 && stn == local_stn) {
+    /* Drop any broadcasts that got looped back */
+    return;
+  }
+  stats.rx.packets++;
+  first = get_small_mbuf();
+  if (!first) return;
+  first->m_un.mun_dat[0] = ((int)(&our_dib)) & 0xff;
+  first->m_un.mun_dat[1] = (((int)(&our_dib)) & 0xff00)>>8;
+  first->m_un.mun_dat[2] = (((int)(&our_dib)) & 0xff0000)>>16;
+  first->m_un.mun_dat[3] = (((int)(&our_dib)) & 0xff000000)>>24;
+  first->m_un.mun_dat[4] = 0;
+  first->m_un.mun_dat[5] = 0;
+  first->m_un.mun_dat[6] = 0;
+  first->m_un.mun_dat[7] = 0;
+  first->m_un.mun_dat[8] = stn;
+  first->m_un.mun_dat[9] = net;
+  first->m_off = 12;
+  first->m_len = 10;
+  first->m_type = 2;
+  switch(cb) {
+    case EcCb_ARP:
+    case EcCb_ARPreply:
+      frametype = Frame_ARP;
+      break;
+    case EcCb_Frame:
+      frametype = Frame_IP;
+      break;
+    default:
+      return;
+      break;
+  }
+  mb = get_large_mbuf();
+  if (mb) {
+    /* Wahey!  There was a free big mbuf */
+    if (frametype == Frame_ARP) {
+      struct arp *ah = (struct arp *)mb->m_un.mun_datp;
+      if (mb->m_len < 28) {
+        frametype = 0;
+        goto bail;
+      }
+      /* watch out for net byte order here */
+      ah->ar_hrd = 0x100;  /* Ethernet hardware type */
+      ah->ar_pro = 0x8; /* IP over Ethernet */
+      ah->ar_hln = 6;
+      ah->ar_pln = 4;
+      ah->ar_op = (cb==EcCb_ARP)?0x100:0x200; /* ARPOP_REQUEST:ARPOP_REPLY */
+      ah->ar_tha[0] = 0;  /* Fill in the Econet addresses */
+      ah->ar_tha[1] = 0;
+      ah->ar_tha[2] = 0;
+      ah->ar_tha[3] = 0;
+      ah->ar_sha[0] = 0;
+      ah->ar_sha[1] = 0;
+      ah->ar_sha[2] = 0;
+      ah->ar_sha[3] = 0;
+      ah->ar_tha[4] = local_stn; /* It's for me */
+      ah->ar_tha[5] = local_net;
+      ah->ar_sha[4] = stn;
+      ah->ar_sha[5] = net;
+      memcpy(ah->ar_tip, ((char *)buffer)+4, 4);  /* Copy over the IP addresses */
+      memcpy(ah->ar_sip, buffer, 4);
+      mb->m_len = 28; /* arp length */
+      mb->m_type = 1;
+/*      mb->m_type = frametype; */
+    } else {
+      if (mb->m_len < length) {
+        stats.rx.dropped++;
+        frametype = 0;
+        goto bail;
+      }
+      memcpy(mb->m_un.mun_datp, buffer, length);
+      mb->m_type = 1;
+      mb->m_len = length;
+    }
+    mb->m_off = 0;
+    first->m_next = mb;
+/*    first->m_type = frametype; */
+  } else {
+    /* Drats.  No free large mbufs; we have to fall back on small ones */
+    struct mbuf *last = first;
+    while (length) {
+      int copied;
+      mb = get_small_mbuf();
+      last->m_next = mb;
+      if (!mb) {
+        /* No free mbufs at all */
+        frametype = 0;
+        stats.rx.dropped++;
+        goto bail;
+      }
+      copied = lesser(mb->m_len, length);
+      mb->m_off = 12;
+      mb->m_type = 1;
+/*      mb->m_type = frametype; */
+      memcpy(mb->m_un.mun_dat, buffer, copied);
+      length -= copied;
+      last = mb;
+    }
+    last->m_next = NULL;
+/*    first->m_type = frametype; */
+  }
+bail:
+  r.r[0] = rxevent;
+  r.r[1] = (int)first;
+  r.r[2] = (int)"ec";
+  r.r[3] = 0;
+  r.r[4] = frametype;
+  _kernel_swi(XOS_Bit | OS_GenerateEvent, &r, &r);
+}
+
+void CloseRx(int i)
+{
+  _kernel_swi_regs r;
+  if (rxcb[i]) {
+    r.r[0] = rxcb[i];
+    _kernel_swi(XOS_Bit | Econet_AbandonReceive, &r, &r);
+    rxcb[i] = 0;
+  }
+}
+
+/* -- misc */
+
+int ec_ticker_handler(void)
+{
+  int i;
+  _kernel_swi_regs r;
+  for (i = 0; i < TX_QUEUE_LENGTH; i++) {
+    if (txqueue[i]) {
+      r.r[0] = txqueue[i]->handle;
+      _kernel_swi(Econet_PollTransmit, &r, &r);
+      if (r.r[0] < 5)
+        tx_complete(txqueue[i]);
+    }
+  }
+  return 1;
+}
+
+int ec_event_handler(void)
+{
+  _kernel_swi_regs r;
+  int slot = -1, i;
+  switch (ec_event_r0) {
+    case 14: /* rx */
+      for (i = 0; i < NUM_RXCBS; i++)
+        if (rxcb[i] == ec_event_r1) slot = i;
+      if (slot == -1)
+        return 1;
+      r.r[0] = rxcb[slot];
+      _kernel_swi(Econet_AbandonAndReadReceive, &r, &r);
+      rxcb[slot] = 0;
+      rx_handler(r.r[3], r.r[4], r.r[1], (void *)r.r[5], r.r[6]);
+      OpenRx(slot);
+      break;
+    case 15:  /* tx */
+      for (i = 0; i < TX_QUEUE_LENGTH; i++) {
+        if (txqueue[i]) {
+          if (txqueue[i]->handle == ec_event_r1) {
+            slot = i;
+          }
+        }
+      }
+      if (slot == -1)
+        return 1;
+      tx_complete(txqueue[slot]);
+      break;
+  }
+  return 1;
+}
+
+void ec_final(void)
+{
+  int i;
+  _kernel_swi_regs r;
+  r.r[1] = Service_NetworkDriverStatus;
+  r.r[2] = 1; /* dying */
+  r.r[3] = (int)&our_dib;
+  _kernel_swi(XOS_Bit | OS_ServiceCall, &r, &r);
+  for (i = 0; i < 4; i++)
+    CloseRx(i);
+  r.r[0] = IP_PORT;
+  _kernel_swi(XOS_Bit | Econet_ReleasePort, &r, &r);
+  r.r[0] = 0x10;
+  r.r[1] = (int)ec_event_prehandler;
+  r.r[2] = (int)private_word;
+  _kernel_swi(XOS_Bit | OS_Release, &r, &r);
+  r.r[0] = (int)ec_ticker_handler;
+  r.r[1] = (int)private_word;
+  _kernel_swi(XOS_Bit | OS_RemoveTickerEvent, &r, &r);
+  _kernel_osbyte(13, 14, 0);
+  _kernel_osbyte(13, 15, 0);
+}
+
+_kernel_oserror *ec_initialise(char *cmd, int base, void *pw)
+{
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+  int i;
+  r.r[0] = 0;
+  r.r[1] = 0xff;
+  for (i = 0; i < NUM_RXCBS; i++)
+    rxbuf[i]=malloc(1024);
+  for (i = 0; i < TX_QUEUE_LENGTH; i++)
+    txqueue[i] = NULL;
+  if (_kernel_swi(XOS_Bit | Econet_SetProtection, &r, &r)) {
+    strcpy(err.errmess, "Econet not present");
+    return &err;
+  }
+  if ((e = _kernel_swi(XOS_Bit | Econet_ReadLocalStationAndNet, &r, &r)) != NULL)
+    return e;
+  local_stn = r.r[0];
+  local_net = r.r[1];
+  local_addr[4] = local_stn;
+  local_addr[5] = local_net;
+  r.r[0] = IP_PORT;
+  if ((e = _kernel_swi(XOS_Bit | Econet_ClaimPort, &r, &r)) != NULL)
+    return e;
+  our_dib.dib_name = "ec";
+  our_dib.dib_units = 1;
+  our_dib.dib_swibase = 0x43cc0;
+  our_dib.dib_address[0] = local_addr;
+  our_dib.dib_module = "EconetA";
+  r.r[1] = Service_NetworkDriverStatus;
+  r.r[2] = 0; /* starting */
+  r.r[3] = (int)&our_dib;
+  if (_kernel_swi(XOS_Bit | OS_ServiceCall, &r, &r))
+    return e;
+  r.r[0] = 0x10;
+  r.r[1] = (int)ec_event_prehandler;
+  r.r[2] = (int)pw;
+  if ((e = _kernel_swi(XOS_Bit | OS_Claim, &r, &r)) != NULL)
+    return e;
+  _kernel_osbyte(14, 14, 0);
+  _kernel_osbyte(14, 15, 0);
+  r.r[0] = 500;
+  r.r[1] = (int)ec_ticker_handler;
+  r.r[2] = (int)pw;
+  if ((e = _kernel_swi(XOS_Bit | OS_CallEvery, &r, &r)) != NULL)
+    return e;
+  atexit(ec_final);
+  private_word = pw;
+  return NULL;
+}
+
+_kernel_oserror *ec_swi(int num, _kernel_swi_regs *regs, void *pw)
+{
+  int i;
+  switch(num) {
+  case SWI_NetworkIfStart:
+    return NULL;
+    break;
+  case SWI_NetworkIfUp:
+    for (i = 0; i < NUM_RXCBS; i++)
+      OpenRx(i);
+    return NULL;
+    break;
+  case SWI_NetworkIfDown:
+    for (i = 0; i < NUM_RXCBS; i++)
+      CloseRx(i);
+    return NULL;
+    break;
+  case SWI_NetworkIfSend:
+    ec_send(regs, pw);
+    return NULL;
+    break;
+  case SWI_DCIVersion:
+    regs->r[0] = 3;
+    return NULL;
+    break;
+  case SWI_NetworkMTU:
+    regs->r[0] = 1280;
+    return NULL;
+    break;
+  case SWI_TxEventRequired:
+    regs->r[0] = 0;
+    return NULL;
+    break;
+  }
+  return NULL;
+}
+
+_kernel_oserror *ec_cmd(char *arg_string, int argc, int cmd_no, void *pw)
+{
+  int i, c = 0;
+  printf("tx:  %d packets (%d synchronous), %d dropped\n", stats.tx.packets, stats.tx.sync, stats.tx.dropped);
+  printf("     %d not listening, %d line jammed, %d net error, %d no clock\n", stats.tx.not_listening, stats.tx.line_jammed, stats.tx.net_error, stats.tx.no_clock);
+  printf("rx:  %d packets, %d dropped\n\n", stats.rx.packets, stats.rx.dropped);
+  for (i = 0; i < TX_QUEUE_LENGTH; i++)
+    if (txqueue[i]) c++;
+  printf("Rxcbs: %d\n", NUM_RXCBS);
+  printf("Tx queue: %d/%d\n", c, TX_QUEUE_LENGTH);
+  printf("Local addr: %02x:%02x:%02x:%02x:%02x:%02x\n", local_addr[0], local_addr[1], local_addr[2], local_addr[3], local_addr[4], local_addr[5]);
+  return NULL;
+}
+
+_kernel_oserror *ec_service(int num, _kernel_swi_regs *regs, void *pw)
+{
+  int i;
+  switch(num) {
+  case Service_FindNetworkDriver:
+    if (!strcmp((char *)regs->r[2], "ec")) {
+      struct pib *p = (struct pib *)regs->r[3];
+      freeq = p->pib_freeq;
+      lfreeq = p->pib_lfreeq;
+      rxevent = p->pib_rxevent;
+      regs->r[1] = 0;
+      regs->r[3] = (int)&our_dib;
+      for (i = 0; i < NUM_RXCBS; i++)
+        OpenRx(i);
+    }
+    break;
+  }
+  return NULL;
+}

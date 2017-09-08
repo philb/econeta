@@ -1,0 +1,109 @@
+#define IP_PORT  0xd2
+
+#define Frame_IP     0x800
+#define Frame_ARP    0x806
+
+#define EcCb_ARP  0x21
+#define EcCb_ARPreply 0x22
+#define EcCb_Frame 0x01
+
+#define Service_FindNetworkDriver   0x84
+#define Service_ProtocolDying       0x83
+#define Service_NetworkDriverStatus 0x8B
+
+#define SWI_NetworkIfStart     0
+#define SWI_NetworkIfUp        1
+#define SWI_NetworkIfDown      2
+#define SWI_NetworkIfSend      3
+#define SWI_DCIVersion         4
+#define SWI_NetworkMTU         5
+#define SWI_TxEventRequired    6
+
+#define MSIZE      128
+#define MMINOFF    12
+#define MTAIL      4
+#define MLEN       (MSIZE-MMINOFF-MTAIL)
+
+struct mbuf {
+        struct mbuf *m_next;       /* mbuf chain pointer */
+        unsigned long m_off;       /* offset from start of mbuf to start */
+                                   /* of active data in m_dat[] */
+        short m_len;               /* amount of active data in m_dat[] */
+        char  m_type;              /* not used by driver module */
+        char m_indir;              /* data is indirect */
+        union {
+                char mun_dat[MLEN]; /* data storage */
+                char *mun_datp;     /* indirect data pointer */
+        } m_un;
+        struct mbuf *m_act;        /* not used by driver module */
+};
+
+/* Driver Information Block */
+struct dib
+{
+        char *dib_name;
+        int  dib_units;
+        int  dib_swibase;
+        char *dib_address[4];
+        char *dib_module;
+};
+
+/* Protocol Information Block */
+struct pib {
+    char        pib_frtypecnt;
+    unsigned short pib_frtype[6];
+    int         pib_rxevent;
+    struct mbuf **pib_freeq;
+    int         pib_sccall;
+    struct mbuf **pib_lfreeq;
+};
+
+/* Internal statistics */
+struct ec_stats {
+  struct {
+    int packets;
+    int no_clock;
+    int line_jammed;
+    int not_listening;
+    int net_error;
+    int dropped;
+    int sync;
+  } tx;
+  struct {
+    int packets;
+    int dropped;
+  } rx;
+};
+
+struct tx {
+  int handle;  /* our TX handle */
+  int event;   /* Event# to call on completion */
+  char *iface; /* interface name */
+  int pun;     /* physical unit number */
+  int sync;    /* 1 if this tx is synchronous */
+  struct mbuf *mb; /* tx data chain */
+  void *buffer; /* our tx buffer */
+  int queue;   /* queue position */
+};
+
+/* Ethernet ARP frame */
+struct arp {
+  unsigned short ar_hrd;
+  unsigned short ar_pro;
+  unsigned char  ar_hln;
+  unsigned char  ar_pln;
+  unsigned short ar_op;
+  unsigned char  ar_sha[6];
+  unsigned char  ar_sip[4];
+  unsigned char  ar_tha[6];
+  unsigned char  ar_tip[4];
+};
+
+#define TX_QUEUE_LENGTH 10
+#define NUM_RXCBS	5
+#undef  ASYNC_TX
+
+extern void ec_event_prehandler(void);
+extern int ec_event_r0;  /* holds R0 on entry to event code */
+extern int ec_event_r1;  /* ditto, R1 */
+

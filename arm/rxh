@@ -1,0 +1,22 @@
+	OUTPUT AOF
+
+	AREA	ARM$$Code: CODE, READONLY
+
+	INCLUDE	ARM:inc.APCS-R
+
+	IMPORT	ec_event_entry
+
+	EXPORT	ec_event_prehandler
+	EXPORT	ec_event_r0
+	EXPORT	ec_event_r1
+ec_event_prehandler
+	TEQ	R0,#14
+	TEQNE	R0,#15
+	MOVNES	PC,R14
+	STR	R0,ec_event_r0
+	STR	R1,ec_event_r1
+	B	ec_event_entry
+
+ec_event_r0	DCD	0
+ec_event_r1	DCD	0
+
